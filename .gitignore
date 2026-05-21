@@ -6,6 +6,14 @@ dist/
 .env
 .env.local
 .env.*.local
+.env.mailbox-relay.local
+render-env-local.txt
+
+# Relais SMTP LWS (secret — régénérer avec npm run setup:mailbox-relay)
+secrets/
+secrets/mailbox-encryption.key
+public/api/mailbox-relay.config.php
+api/mailbox-relay.config.php
 
 # Le .env.production contient des URLs publiques (pas de clés) — OK à committer
 # Mais si tu y mets des clés secrètes, ajoute-le ici aussi

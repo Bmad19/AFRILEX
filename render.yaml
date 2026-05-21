@@ -20,3 +20,9 @@ services:
         sync: false
       - key: GROQ_API_KEY
         sync: false
+      - key: MAILBOX_LWS_PROXY_URL
+        value: https://www.afrilexconseil.com/api/bureau/mailbox-send.php
+      - key: MAILBOX_PROXY_SECRET
+        sync: false
+      - key: MAILBOX_ENCRYPTION_KEY
+        sync: false

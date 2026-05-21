@@ -244,7 +244,8 @@ export function MailboxPage() {
       const lines = r.results.map((x) =>
         `  ${x.ok ? "✅" : "❌"} ${x.host ?? r.host}:${x.port} (${x.secure ? "SSL" : "STARTTLS"}) — ${x.ms}ms${x.error ? `\n     → ${x.error}` : ""}`,
       ).join("\n");
-      alert(`Test SMTP — ${r.host}\n\n${lines}\n\n${r.recommendation}`);
+      const proxyLine = (r as { proxy_ok?: boolean }).proxy_ok ? "\n\n✅ Relais LWS (mailbox-send.php) opérationnel." : "";
+      alert(`Test SMTP — ${r.host}\n\n${lines}${proxyLine}\n\n${r.recommendation}`);
     } catch (e: unknown) {
       alert(e instanceof Error ? e.message : "Erreur");
     } finally {
@@ -362,14 +363,18 @@ export function MailboxPage() {
     setSending(true);
     setSendResult(null);
     try {
-      const r = await mailboxApi.send(activeId, {
-        to: compose.to,
-        cc: compose.cc,
-        bcc: compose.bcc,
-        subject: compose.subject,
-        text: compose.text,
-        in_reply_to: compose.in_reply_to,
-      });
+      const doSend = (smtpPassword?: string) =>
+        mailboxApi.send(activeId, {
+          to: compose.to,
+          cc: compose.cc,
+          bcc: compose.bcc,
+          subject: compose.subject,
+          text: compose.text,
+          in_reply_to: compose.in_reply_to,
+          ...(smtpPassword ? { smtp_password: smtpPassword } : {}),
+        });
+
+      let r = await doSend();
       if (r.success) {
         setSendResult({ kind: "ok", text: `Envoyé à ${r.accepted?.join(", ") ?? compose.to}` });
         setTimeout(() => setComposeOpen(false), 1200);
@@ -377,7 +382,41 @@ export function MailboxPage() {
         setSendResult({ kind: "err", text: "Échec d'envoi (réponse non OK)" });
       }
     } catch (e: unknown) {
-      setSendResult({ kind: "err", text: e instanceof Error ? e.message : "Échec d'envoi" });
+      const msg = e instanceof Error ? e.message : "Échec d'envoi";
+      const needsPwd = /needs_smtp_password|Déchiffrement|mot de passe/i.test(msg);
+      if (needsPwd) {
+        const pwd = window.prompt(
+          "Mot de passe SMTP de ce compte (identique à Roundcube / webmail LWS).\n" +
+            "Il sera enregistré à nouveau pour les prochains envois.",
+        );
+        if (pwd?.trim()) {
+          try {
+            const r2 = await mailboxApi.send(activeId, {
+              to: compose.to,
+              cc: compose.cc,
+              bcc: compose.bcc,
+              subject: compose.subject,
+              text: compose.text,
+              in_reply_to: compose.in_reply_to,
+              smtp_password: pwd.trim(),
+            });
+            if (r2.success) {
+              try {
+                await mailboxApi.updateAccount(activeId, { password: pwd.trim() });
+              } catch { /* envoi OK même si re-enregistrement échoue */ }
+              setSendResult({ kind: "ok", text: `Envoyé à ${r2.accepted?.join(", ") ?? compose.to}` });
+              setTimeout(() => setComposeOpen(false), 1200);
+              setSending(false);
+              return;
+            }
+          } catch (e2: unknown) {
+            setSendResult({ kind: "err", text: e2 instanceof Error ? e2.message : "Échec après saisie du mot de passe" });
+            setSending(false);
+            return;
+          }
+        }
+      }
+      setSendResult({ kind: "err", text: msg });
     } finally {
       setSending(false);
     }
@@ -869,7 +908,7 @@ export function MailboxPage() {
                   Annuler
                 </button>
                 <button onClick={sendCompose} disabled={sending} className="flex-1 rounded-xl bg-coral py-3 text-sm font-bold text-white hover:brightness-110 transition disabled:opacity-40">
-                  {sending ? "Envoi…" : "✈ Envoyer"}
+                  {sending ? "Envoi en cours (peut prendre 1–2 min)…" : "✈ Envoyer"}
                 </button>
               </div>
             </motion.div>

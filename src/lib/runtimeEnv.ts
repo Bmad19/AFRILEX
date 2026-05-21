@@ -9,6 +9,8 @@ export type AfrilexPublicConfig = Partial<{
   VITE_API_URL: string;
   VITE_CAREERS_API_URL: string;
   VITE_WP_REST_BASE: string;
+  /** Envoi boîte mail (PHP LWS, same-origin) */
+  VITE_MAIL_SEND_API: string;
 }>;
 
 declare global {

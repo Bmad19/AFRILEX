@@ -16,4 +16,6 @@ window.__AFRILEX_CONFIG__ = window.__AFRILEX_CONFIG__ || {
   VITE_API_URL: "",
   VITE_CAREERS_API_URL: "",
   VITE_WP_REST_BASE: "",
+  /** Envoi boîte mail : PHP sur le même domaine (LWS) — ne pas pointer vers Render */
+  VITE_MAIL_SEND_API: "/api/bureau/mailbox-send.php",
 };

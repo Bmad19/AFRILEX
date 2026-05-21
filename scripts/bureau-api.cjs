@@ -160,7 +160,24 @@ app.get('/api/bureau/health', async (_req, res) => {
     if (uErr) issues.push(`users: ${uErr.message}`);
     if (sErr) issues.push(`sessions: ${sErr.message}`);
     if (issues.length) return res.status(503).json({ ok: false, issues });
-    return res.json({ ok: true });
+    const proxyUrl = (process.env.MAILBOX_LWS_PROXY_URL || '').trim();
+    let proxyPing = null;
+    if (proxyUrl) {
+      try {
+        const pingUrl = proxyUrl.includes('?') ? `${proxyUrl}&ping=1` : `${proxyUrl}?ping=1`;
+        const pr = await fetch(pingUrl, { signal: AbortSignal.timeout(15000) });
+        const pt = await pr.text();
+        proxyPing = { status: pr.status, ok: pr.ok, body: pt.slice(0, 200) };
+      } catch (e) {
+        proxyPing = { ok: false, error: String(e?.message || e) };
+      }
+    }
+    return res.json({
+      ok: true,
+      mailbox_proxy: mailboxProxyConfigured(),
+      mailbox_proxy_url: proxyUrl || null,
+      mailbox_proxy_ping: proxyPing,
+    });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
@@ -222,23 +239,34 @@ function safeComparePassword(plain, hash) {
   }
 }
 
+/** Token bureau : header Authorization, query bureau_token ou corps JSON (appels PHP LWS → Render). */
+function getBearerToken(req) {
+  const m = (req.headers.authorization ?? '').match(/^Bearer\s+(.+)$/i);
+  if (m) return m[1].trim();
+  const q = req.query?.bureau_token;
+  if (q) return String(q).trim();
+  const b = req.body?.bureau_token;
+  if (b) return String(b).trim();
+  return null;
+}
+
 // Auth guard bureau — retourne user ou null (envoie la réponse si erreur)
 async function authGuard(req, res, minRole = 'agent') {
-  const m = (req.headers.authorization ?? '').match(/^Bearer\s+(.+)$/i);
-  if (!m) { res.status(401).json({ error: 'Non authentifié' }); return null; }
+  const token = getBearerToken(req);
+  if (!token) { res.status(401).json({ error: 'Non authentifié' }); return null; }
 
   // Essai 1 : avec la colonne `permissions` (addon supabase_perms_mailbox_addon.sql appliqué)
   let { data: sess, error: sessErr } = await supabase
     .from('sessions')
     .select('expires_at, user:users!user_id(id,username,full_name,email,role,active,first_login,avatar,password,permissions)')
-    .eq('token', m[1])
+    .eq('token', token)
     .maybeSingle();
   // Fallback : colonne `permissions` absente → on retry sans elle (schéma de base)
   if (sessErr && /permissions|does not exist|schema cache/i.test(sessErr.message || '')) {
     const fb = await supabase
       .from('sessions')
       .select('expires_at, user:users!user_id(id,username,full_name,email,role,active,first_login,avatar,password)')
-      .eq('token', m[1])
+      .eq('token', token)
       .maybeSingle();
     sess = fb.data; sessErr = fb.error;
   }
@@ -252,7 +280,7 @@ async function authGuard(req, res, minRole = 'agent') {
     return null;
   }
   // Prolonge la session
-  await supabase.from('sessions').update({ expires_at: in8h() }).eq('token', m[1]);
+  await supabase.from('sessions').update({ expires_at: in8h() }).eq('token', token);
   req.user = sess.user;
   return sess.user;
 }
@@ -3499,47 +3527,105 @@ app.all('/api/bureau/mailbox.php', async (req, res) => {
     }
 
     if (action === 'test_smtp' && req.method === 'POST') {
-      // Diagnostic : tente d'établir la connexion SMTP sans envoyer de mail.
-      // Renvoie le détail de chaque essai (port, secure, ok/error).
       if (!nodemailer) return res.status(503).json({ error: 'nodemailer absent' });
       const accountId = +id;
       const account = await loadMailboxAccount(accountId, true);
       if (!account) return res.status(404).json({ error: 'Compte introuvable' });
-      const baseHost = account.smtp_host || account.imap_host;
-      const declared = { port: account.smtp_port ?? 465, secure: account.smtp_secure ?? true };
-      const altPort = declared.port === 465 ? 587 : (declared.port === 587 ? 465 : null);
-      const tests = [declared];
-      if (altPort) tests.push({ port: altPort, secure: altPort === 465 });
-      tests.push({ port: 25, secure: false });
       const results = [];
       let firstOk = null;
-      for (const t of tests) {
-        const transporter = nodemailer.createTransport({
-          host: baseHost, port: t.port, secure: t.secure, requireTLS: !t.secure,
-          auth: { user: account.email, pass: decryptSecret(account.password_enc) },
-          connectionTimeout: 10000, greetingTimeout: 8000, socketTimeout: 12000,
-          tls: { rejectUnauthorized: false },
-        });
+      let proxyOk = null;
+
+      if (mailboxProxyConfigured()) {
         const start = Date.now();
-        try {
-          await transporter.verify();
-          const ms = Date.now() - start;
-          results.push({ ...t, ok: true, ms });
-          if (!firstOk) firstOk = t;
-        } catch (e) {
-          results.push({ ...t, ok: false, ms: Date.now() - start, error: String(e?.message || e).slice(0, 200) });
-        } finally {
-          try { transporter.close(); } catch { /* ignore */ }
+        const proxy = await sendViaLwsProxy(account, {
+          to: [account.email],
+          subject: 'Test',
+          text: '',
+        }, null, { verifyOnly: true });
+        const ms = Date.now() - start;
+        if (proxy?.ok) {
+          proxyOk = proxy.working || { via: 'lws_proxy' };
+          const w = proxy.working || {};
+          results.push({
+            host: w.host || 'lws_proxy',
+            port: w.port || 0,
+            secure: !!w.secure,
+            ok: true,
+            ms,
+            via: 'lws_proxy',
+          });
+          firstOk = results[0];
+        } else {
+          results.push({
+            host: 'lws_proxy',
+            port: 0,
+            secure: false,
+            ok: false,
+            ms,
+            via: 'lws_proxy',
+            error: proxy?.error || 'Relais LWS échoué',
+          });
         }
       }
+
+      if (!firstOk) {
+        for (const t of buildSmtpAttempts(account).slice(0, 3)) {
+          const transporter = createSmtpTransporter(t.host, t.port, t.secure, account);
+          const start = Date.now();
+          try {
+            await transporter.verify();
+            const ms = Date.now() - start;
+            const row = { host: t.host, port: t.port, secure: t.secure, ok: true, ms, via: 'direct' };
+            results.push(row);
+            if (!firstOk) firstOk = row;
+          } catch (e) {
+            results.push({
+              host: t.host, port: t.port, secure: t.secure, ok: false,
+              ms: Date.now() - start, via: 'direct',
+              error: String(e?.message || e).slice(0, 220),
+            });
+          } finally {
+            try { transporter.close(); } catch { /* ignore */ }
+          }
+          if (firstOk) break;
+        }
+      }
+
+      const proxyHint = mailboxProxyConfigured()
+        ? ''
+        : ' Ajoutez MAILBOX_LWS_PROXY_URL + MAILBOX_PROXY_SECRET sur Render et uploadez dist/api/.';
       return res.json({
         success: !!firstOk,
-        host: baseHost,
+        host: firstOk?.host || resolveSmtpHosts(account)[0],
         results,
-        recommendation: firstOk
-          ? `✅ Port ${firstOk.port} (${firstOk.secure ? 'SSL' : 'STARTTLS'}) fonctionne. Configurez ce port dans le compte mail.`
-          : "❌ Aucun port SMTP joignable depuis Render. Render free tier bloque parfois SMTP — solution : utiliser un relais transactionnel (Resend, Mailgun, Brevo) avec API HTTPS, OU passer en plan payant Render ($7/mois).",
+        proxy_ok: !!proxyOk,
+        mailbox_proxy: mailboxProxyConfigured(),
+        recommendation: proxyOk
+          ? `✅ Relais LWS OK (${proxyOk.host}:${proxyOk.port} ${proxyOk.secure ? 'SSL' : 'STARTTLS'}).`
+          : firstOk
+            ? `✅ SMTP direct ${firstOk.host}:${firstOk.port}.`
+            : `❌ Échec envoi.${proxyHint}`,
       });
+    }
+
+    /** Mot de passe SMTP déchiffré côté Render (appel serveur-à-serveur depuis PHP LWS). */
+    if (action === 'mail_password' && (req.method === 'GET' || req.method === 'POST')) {
+      const accountId = +id;
+      if (!Number.isFinite(accountId)) return res.status(400).json({ error: 'id requis' });
+      const account = await loadMailboxAccount(accountId, true);
+      if (!account) return res.status(404).json({ error: 'Compte introuvable' });
+      if (!account.password_enc) {
+        return res.status(400).json({ error: 'Aucun mot de passe enregistré — modifiez le compte et saisissez le mot de passe LWS.' });
+      }
+      try {
+        const password = decryptSecret(account.password_enc);
+        return res.json({ password });
+      } catch (e) {
+        return res.status(500).json({
+          error: String(e?.message || e),
+          hint: 'Dans Boîte mail → Modifier le compte → ressaisissez le mot de passe (identique à Roundcube) puis Enregistrer.',
+        });
+      }
     }
 
     if (action === 'send' && req.method === 'POST') {
@@ -3565,7 +3651,16 @@ app.all('/api/bureau/mailbox.php', async (req, res) => {
         inReplyTo: in_reply_to || undefined,
       });
       if (!info.ok) {
-        return res.status(502).json({ success: false, error: info.error, attempted: info.attempted });
+        return res.status(502).json({
+          success: false,
+          error: info.error,
+          attempted: info.attempted,
+          via: info.via || (mailboxProxyConfigured() ? 'lws_proxy' : 'direct'),
+          mailbox_proxy: mailboxProxyConfigured(),
+          hint: info.hint || (!mailboxProxyConfigured()
+            ? 'Déployez dist/api/ sur LWS et MAILBOX_* sur Render.'
+            : 'Re-uploadez dist/api/mailbox-relay.config.php et vérifiez le secret Render.'),
+        });
       }
       // Best-effort : copie dans le dossier "Sent" — fire-and-forget, n'attend PAS la réponse.
       appendToSentFolderInBackground(account, info.raw).catch(() => {});
@@ -3700,6 +3795,183 @@ app.all('/api/bureau/mailbox.php', async (req, res) => {
   }
 });
 
+/** Hôtes SMTP à essayer (LWS : mail.domaine, parfois smtp.domaine ou lwspanel). */
+function resolveSmtpHosts(account) {
+  const email = String(account.email || '').trim().toLowerCase();
+  const domain = email.split('@')[1] || '';
+  const seen = new Set();
+  const out = [];
+  const push = (h) => {
+    const host = String(h || '').trim().toLowerCase();
+    if (!host || seen.has(host)) return;
+    seen.add(host);
+    out.push(host);
+  };
+  push(account.smtp_host);
+  push(account.imap_host);
+  if (domain) {
+    push(`mail.${domain}`);
+    push(`smtp.${domain}`);
+  }
+  push('mail.lws-hosting.com');
+  return out;
+}
+
+/** Matrice host × port pour envoi / test SMTP (587 STARTTLS souvent le plus fiable). */
+function buildSmtpAttempts(account) {
+  const declaredPort = account.smtp_port ?? 465;
+  const declaredSecure = account.smtp_secure ?? true;
+  const portModes = [];
+  const addPort = (port, secure) => {
+    const key = `${port}:${secure ? 1 : 0}`;
+    if (portModes.some((p) => `${p.port}:${p.secure ? 1 : 0}` === key)) return;
+    portModes.push({ port, secure });
+  };
+  addPort(declaredPort, declaredSecure);
+  if (declaredPort !== 587) addPort(587, false);
+  if (declaredPort !== 465) addPort(465, true);
+  if (![25, 465, 587].includes(declaredPort)) addPort(25, false);
+
+  const hosts = resolveSmtpHosts(account);
+  const attempts = [];
+  const seen = new Set();
+  for (const host of hosts) {
+    for (const pm of portModes) {
+      const key = `${host}:${pm.port}:${pm.secure ? 1 : 0}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      attempts.push({ host, port: pm.port, secure: pm.secure });
+    }
+  }
+  return attempts;
+}
+
+function isSmtpRetriableError(err) {
+  const m = String(err?.message || err || '').toLowerCase();
+  return /timeout|timed out|econnrefused|enetunreach|ehostunreach|epipe|esock|etimedout|connection closed|socket|tls|ssl|starttls|wrong version|421|454|connection reset/i.test(m);
+}
+
+function isSmtpAuthError(err) {
+  const m = String(err?.message || err || '').toLowerCase();
+  return /535|534|authentication|invalid login|auth failed|credentials|password/i.test(m);
+}
+
+function createSmtpTransporter(host, port, secure, account) {
+  return nodemailer.createTransport({
+    host,
+    port,
+    secure,
+    requireTLS: !secure,
+    auth: { user: account.email, pass: decryptSecret(account.password_enc) },
+    connectionTimeout: 22000,
+    greetingTimeout: 12000,
+    socketTimeout: 45000,
+    family: 4,
+    tls: { servername: host, rejectUnauthorized: false },
+  });
+}
+
+/**
+ * Relais d'envoi sur l'hébergement LWS (PHP) — contourne le blocage SMTP sortant des PaaS (Render free).
+ * Variables : MAILBOX_LWS_PROXY_URL + MAILBOX_PROXY_SECRET (même secret dans api/config.php).
+ */
+function mailboxProxyConfigured() {
+  return !!(process.env.MAILBOX_LWS_PROXY_URL || '').trim() && !!(process.env.MAILBOX_PROXY_SECRET || '').trim();
+}
+
+async function sendViaLwsProxy(account, mail, raw, { verifyOnly = false } = {}) {
+  const url = (process.env.MAILBOX_LWS_PROXY_URL || '').trim();
+  const secret = (process.env.MAILBOX_PROXY_SECRET || '').trim();
+  if (!url || !secret) return null;
+
+  const hosts = resolveSmtpHosts(account);
+  const attempts = buildSmtpAttempts(account);
+  const body = {
+    verify_only: verifyOnly,
+    smtp_host: account.smtp_host || account.imap_host || null,
+    smtp_port: account.smtp_port ?? 465,
+    smtp_secure: account.smtp_secure ?? true,
+    hosts,
+    attempts: attempts.slice(0, 8),
+    user: account.email,
+    pass: decryptSecret(account.password_enc),
+    from: account.email,
+    from_name: account.label || account.email,
+    to: mail.to,
+    cc: mail.cc?.length ? mail.cc : undefined,
+    bcc: mail.bcc?.length ? mail.bcc : undefined,
+    subject: mail.subject,
+    text: mail.text,
+    html: mail.html,
+    in_reply_to: mail.inReplyTo,
+    raw_b64: raw ? raw.toString('base64') : undefined,
+  };
+
+  const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(() => ctrl.abort(), 90000) : null;
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Mailbox-Proxy-Secret': secret,
+      },
+      body: JSON.stringify(body),
+      signal: ctrl?.signal,
+    });
+    const text = await r.text();
+    let data = {};
+    try { data = text ? JSON.parse(text) : {}; } catch { data = { error: text?.slice(0, 300) }; }
+    if (!r.ok) {
+      return {
+        ok: false,
+        error: data.error || `Relais LWS HTTP ${r.status}`,
+        attempted: data.attempted || [{ via: 'lws_proxy', ok: false, error: text?.slice(0, 200) }],
+        via: 'lws_proxy',
+      };
+    }
+    if (!data.success) {
+      return {
+        ok: false,
+        error: data.error || 'Relais LWS : échec',
+        attempted: data.attempted,
+        via: 'lws_proxy',
+      };
+    }
+    return {
+      ok: true,
+      messageId: data.messageId,
+      accepted: data.accepted ?? [],
+      rejected: data.rejected ?? [],
+      raw: data.raw_b64 ? Buffer.from(data.raw_b64, 'base64') : raw,
+      attempted: data.attempted ?? [{ via: 'lws_proxy', ok: true }],
+      via: 'lws_proxy',
+      working: data.working,
+    };
+  } catch (e) {
+    return {
+      ok: false,
+      error: `Relais LWS injoignable : ${String(e?.message || e)}`,
+      attempted: [{ via: 'lws_proxy', ok: false }],
+      via: 'lws_proxy',
+    };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function persistWorkingSmtpConfig(accountId, working) {
+  if (!working?.host || !working?.port) return;
+  try {
+    await supabase.from('mailbox_accounts').update({
+      smtp_host: working.host,
+      smtp_port: working.port,
+      smtp_secure: !!working.secure,
+      updated_at: new Date().toISOString(),
+    }).eq('id', accountId);
+  } catch { /* best-effort */ }
+}
+
 /**
  * Construit le raw RFC822 via MailComposer (nodemailer interne) pour pouvoir le
  * réutiliser dans IMAP APPEND vers le dossier Envoyés.
@@ -3717,18 +3989,10 @@ async function buildRawMessage(mail) {
 }
 
 /**
- * Envoie un email via SMTP avec stratégie résiliente :
- *   • essaie d'abord la config du compte (port/secure tels quels)
- *   • si échec timeout/auth/connect : tente le port alternatif (465 ↔ 587)
- * Renvoie { ok, error?, raw?, messageId?, accepted?, rejected?, attempted: [...] }
+ * Envoi mail : relais LWS (PHP) en priorité sur Render, sinon SMTP direct (dev / VPS).
  */
 async function sendViaSmtpResilient(account, mail) {
-  const baseHost = account.smtp_host || account.imap_host;
-  const declaredPort = account.smtp_port ?? 465;
-  const declaredSecure = account.smtp_secure ?? true;
   const attempts = [];
-
-  // Pré-construit le RFC822 (utile pour Sent folder même si SMTP échoue à un essai).
   const messageId = `<${crypto.randomBytes(12).toString('hex')}@${(account.email.split('@')[1] || 'local')}>`;
   const composed = {
     from: { name: account.label || account.email, address: account.email },
@@ -3743,56 +4007,84 @@ async function sendViaSmtpResilient(account, mail) {
     messageId,
   };
   let raw = null;
-  try { raw = await buildRawMessage(composed); } catch { /* fallback : sendMail composera lui-même */ }
+  try { raw = await buildRawMessage(composed); } catch { /* sendMail composera si besoin */ }
 
-  // Stratégie : port déclaré → alt (465↔587) → port 25 STARTTLS (dernier recours).
-  // Render free tier bloque parfois 465 ; 587 marche le plus souvent ; 25 est le fallback ultime.
-  const tries = [{ port: declaredPort, secure: declaredSecure }];
-  const altPort = declaredPort === 465 ? 587 : (declaredPort === 587 ? 465 : null);
-  if (altPort) tries.push({ port: altPort, secure: altPort === 465 });
-  if (![25, 465, 587].includes(declaredPort) || (declaredPort !== 25 && altPort !== 25)) {
-    tries.push({ port: 25, secure: false });
+  // Render bloque SMTP sortant → relais LWS d'abord (évite 2+ min de timeouts 465/587/25).
+  if (mailboxProxyConfigured()) {
+    const proxy = await sendViaLwsProxy(account, mail, raw);
+    if (proxy?.ok) {
+      if (account.id && proxy.working) await persistWorkingSmtpConfig(account.id, proxy.working);
+      return proxy;
+    }
+    if (proxy) {
+      return {
+        ok: false,
+        via: 'lws_proxy',
+        error: proxy.error || 'Échec relais LWS',
+        attempted: proxy.attempted ?? [{ via: 'lws_proxy', ok: false, error: proxy.error }],
+        hint: 'Vérifiez dist/api/mailbox-relay.config.php sur LWS et MAILBOX_PROXY_SECRET sur Render (identiques).',
+      };
+    }
   }
 
   let lastErr = null;
-  for (const t of tries) {
+  let authFailed = false;
+  const directTries = buildSmtpAttempts(account).slice(0, 4);
+  for (const t of directTries) {
     const transporter = nodemailer.createTransport({
-      host: baseHost,
+      host: t.host,
       port: t.port,
-      secure: t.secure,                          // true=SSL (465), false=STARTTLS (587)
-      requireTLS: !t.secure,                     // force STARTTLS sur 587
+      secure: t.secure,
+      requireTLS: !t.secure,
       auth: { user: account.email, pass: decryptSecret(account.password_enc) },
-      connectionTimeout: 12000,                  // TCP connect (12s)
-      greetingTimeout: 8000,                     // attente du 220 (8s)
-      socketTimeout: 18000,                      // inactivité (18s) — total worst-case ≈ 38s avec fallback
-      tls: { rejectUnauthorized: false },        // tolère certificats non-strictly-signed (LWS partagé)
+      connectionTimeout: 8000,
+      greetingTimeout: 6000,
+      socketTimeout: 12000,
+      family: 4,
+      tls: { servername: t.host, rejectUnauthorized: false },
     });
-
     try {
       const info = await transporter.sendMail(composed);
       try { transporter.close(); } catch { /* ignore */ }
       attempts.push({ ...t, ok: true });
+      if (account.id) await persistWorkingSmtpConfig(account.id, t);
       return {
         ok: true,
         messageId: info.messageId || messageId,
         accepted: info.accepted ?? [],
         rejected: info.rejected ?? [],
-        raw: info.message || raw, // info.message présent uniquement si streamTransport ; sinon notre raw
+        raw: info.message || raw,
         attempted: attempts,
+        via: 'direct',
+        working: t,
       };
     } catch (e) {
       lastErr = e;
-      attempts.push({ ...t, ok: false, error: String(e?.message || e).slice(0, 200) });
+      attempts.push({ ...t, ok: false, error: String(e?.message || e).slice(0, 220) });
       try { transporter.close(); } catch { /* ignore */ }
-      const m = String(e?.message || '').toLowerCase();
-      const retriable = /timeout|econnrefused|enetunreach|ehostunreach|epipe|esock|tls|ssl|starttls|auth|invalid login|535|421|454/i.test(m);
-      if (!retriable) break;
+      if (isSmtpAuthError(e)) { authFailed = true; break; }
+      if (!isSmtpRetriableError(e)) break;
     }
   }
+
+  if (!authFailed && !mailboxProxyConfigured()) {
+    const proxy = await sendViaLwsProxy(account, mail, raw);
+    if (proxy?.ok) {
+      if (account.id && proxy.working) await persistWorkingSmtpConfig(account.id, proxy.working);
+      return proxy;
+    }
+    if (proxy?.attempted) attempts.push(...proxy.attempted);
+    if (proxy?.error) lastErr = new Error(proxy.error);
+  }
+
+  const hint = mailboxProxyConfigured()
+    ? ''
+    : ' Configurez MAILBOX_LWS_PROXY_URL + MAILBOX_PROXY_SECRET sur Render et uploadez dist/api/ (voir MAILBOX-RELAY.md).';
   return {
     ok: false,
-    error: String(lastErr?.message || lastErr || 'Échec inconnu'),
+    error: String(lastErr?.message || lastErr || 'Échec envoi SMTP') + hint,
     attempted: attempts,
+    via: mailboxProxyConfigured() ? 'lws_proxy' : 'direct',
   };
 }
 

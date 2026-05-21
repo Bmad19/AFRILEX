@@ -8,6 +8,13 @@ define('DB_USER',     'numafriq_user');     // Nom d'utilisateur MySQL
 define('DB_PASS',     'VotreMotDePasse');   // Mot de passe MySQL
 define('DB_CHARSET',  'utf8mb4');
 
+// Relais envoi boîte mail (généré par node scripts/setup-mailbox-relay.mjs)
+$_relay = __DIR__ . '/mailbox-relay.config.php';
+if (is_file($_relay)) {
+    require_once $_relay;
+}
+unset($_relay);
+
 // ── Connexion PDO MySQL (singleton) ──────────────────────────────────────────
 function get_db(): PDO {
     static $pdo = null;

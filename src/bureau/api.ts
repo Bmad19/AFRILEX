@@ -5,14 +5,99 @@ const BASE = readRuntimeEnv("VITE_BUREAU_API", "/api/bureau");
 
 function getToken(): string | null { return localStorage.getItem('bureau_token'); }
 
+/** Production : PHP LWS same-origin. Dev local : null → API Node (mailbox.php). */
+function mailboxSendPhpUrl(): string | null {
+  if (import.meta.env.DEV && import.meta.env.VITE_USE_REMOTE_API !== "true") {
+    return null;
+  }
+  const custom = readRuntimeEnv("VITE_MAIL_SEND_API", "");
+  if (custom.trim()) {
+    const c = custom.trim();
+    if (/^https?:\/\//i.test(c)) return c;
+    if (typeof window !== "undefined") {
+      return new URL(c.startsWith("/") ? c : `/${c}`, window.location.origin).href;
+    }
+    return c;
+  }
+  if (typeof window !== "undefined") {
+    return `${window.location.origin}/api/bureau/mailbox-send.php`;
+  }
+  return null;
+}
+
+async function mailboxLwsRequest<T extends Record<string, unknown>>(
+  body: Record<string, unknown>,
+): Promise<T> {
+  const url = mailboxSendPhpUrl();
+  if (!url) throw new Error("Envoi mail : PHP LWS non configuré");
+
+  const signal =
+    typeof AbortSignal !== "undefined" && "timeout" in AbortSignal
+      ? AbortSignal.timeout(90_000)
+      : undefined;
+
+  const token = getToken();
+  if (!token) {
+    throw new Error("Non connecté — reconnectez-vous au bureau.");
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      credentials: "same-origin",
+      signal,
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ ...body, bureau_token: token }),
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `Envoi mail LWS indisponible (${msg}). Re-uploadez tout dist/ (dossier api/bureau/).`,
+    );
+  }
+
+  const text = await res.text();
+  let data: Record<string, unknown> = {};
+  try {
+    data = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+  } catch {
+    data = { error: text?.slice(0, 400) || `Réponse invalide (${res.status})` };
+  }
+
+  if (!res.ok || data.success === false) {
+    const parts = [data.error, data.hint].filter(Boolean) as string[];
+    if (data.via === "lws" || data.via === "lws_proxy") parts.unshift("(serveur LWS)");
+    if (data.needs_smtp_password) parts.push("needs_smtp_password");
+    const attempted = data.attempted as Array<{ error?: string; host?: string; port?: number }> | undefined;
+    if (Array.isArray(attempted) && attempted.length) {
+      const last = attempted.filter((a) => a.error).slice(-2);
+      const lines = last.map((a) => `${a.host ?? ""}:${a.port ?? ""} ${a.error ?? ""}`.trim());
+      if (lines.length) parts.push(lines.join(" · "));
+    }
+    throw new Error(parts.length ? parts.join(" — ") : `Erreur envoi (${res.status})`);
+  }
+  return data as T;
+}
+
 async function request<T = unknown>(
   endpoint: string,
   method: 'GET' | 'POST' | 'PUT' | 'DELETE' = 'GET',
   body?: unknown,
-  params?: Record<string, string>
+  params?: Record<string, string>,
+  opts?: { timeoutMs?: number },
 ): Promise<T> {
   const url = new URL(`${BASE}/${endpoint}`, window.location.origin);
   if (params) Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
+
+  const isMailboxSend = endpoint.includes('mailbox') && params?.action === 'send';
+  const timeoutMs = opts?.timeoutMs ?? (isMailboxSend ? 120_000 : undefined);
+  const signal = timeoutMs && typeof AbortSignal !== 'undefined' && 'timeout' in AbortSignal
+    ? AbortSignal.timeout(timeoutMs)
+    : undefined;
 
   let res: Response;
   try {
@@ -20,6 +105,7 @@ async function request<T = unknown>(
       method,
       mode: "cors",
       credentials: "omit",
+      signal,
       headers: {
         "Content-Type": "application/json",
         ...(getToken() ? { Authorization: `Bearer ${getToken()}` } : {}),
@@ -44,7 +130,19 @@ async function request<T = unknown>(
   }
 
   if (!res.ok) {
-    const parts = [data.error, data.detail].filter(Boolean) as string[];
+    const parts = [data.error, data.detail, data.hint].filter(Boolean) as string[];
+    const via = typeof data.via === 'string' ? data.via : '';
+    if (via === 'lws_proxy') parts.unshift('(relais LWS)');
+    const attempted = data.attempted as Array<{ host?: string; port?: number; secure?: boolean; ok?: boolean; error?: string; via?: string }> | undefined;
+    if (Array.isArray(attempted) && attempted.length) {
+      const fail = attempted.filter((a) => !a.ok).slice(-4);
+      const lines = fail.map((a) => {
+        const tag = a.via === 'lws_proxy' ? 'LWS' : '';
+        const h = a.host && a.host !== 'lws_proxy' ? `${a.host}:` : tag;
+        return `${h}${a.port ? a.port : ''} ${a.error ? `→ ${String(a.error).slice(0, 100)}` : ''}`.trim();
+      }).filter(Boolean);
+      if (lines.length) parts.push(lines.join(' · '));
+    }
     throw new Error(parts.length ? parts.join(" — ") : `Erreur ${res.status}`);
   }
   return data as T;
@@ -931,7 +1029,7 @@ export const mailboxApi = {
       uid: String(uid),
       ...(folder ? { folder } : {}),
     }),
-  send: (id: number, payload: {
+  send: async (id: number, payload: {
     to: string;
     cc?: string;
     bcc?: string;
@@ -939,17 +1037,43 @@ export const mailboxApi = {
     text?: string;
     html?: string;
     in_reply_to?: string;
-  }) =>
-    request<{ success: boolean; messageId?: string; accepted?: string[]; rejected?: string[]; attempted?: Array<{ port: number; secure: boolean; ok: boolean; error?: string }> }>(
-      'mailbox.php', 'POST', payload, { action: 'send', id: String(id) },
-    ),
-  testSmtp: (id: number) =>
-    request<{
+    /** Secours si le déchiffrement échoue (mot de passe boîte LWS / Roundcube). */
+    smtp_password?: string;
+  }) => {
+    const php = mailboxSendPhpUrl();
+    if (php) {
+      return mailboxLwsRequest<{
+        success: boolean;
+        messageId?: string;
+        accepted?: string[];
+        rejected?: string[];
+      }>({
+        action: "send",
+        account_id: id,
+        ...payload,
+      });
+    }
+    return request<{ success: boolean; messageId?: string; accepted?: string[]; rejected?: string[] }>(
+      "mailbox.php", "POST", payload, { action: "send", id: String(id) },
+    );
+  },
+  testSmtp: async (id: number) => {
+    const php = mailboxSendPhpUrl();
+    if (php) {
+      return mailboxLwsRequest<{
+        success: boolean;
+        host: string;
+        results: Array<{ port: number; secure: boolean; ok: boolean; ms: number; error?: string }>;
+        recommendation: string;
+      }>({ action: "test_smtp", account_id: id });
+    }
+    return request<{
       success: boolean;
       host: string;
       results: Array<{ port: number; secure: boolean; ok: boolean; ms: number; error?: string }>;
       recommendation: string;
-    }>('mailbox.php', 'POST', undefined, { action: 'test_smtp', id: String(id) }),
+    }>("mailbox.php", "POST", undefined, { action: "test_smtp", id: String(id) });
+  },
   /** Supprime un message : déplacé vers Corbeille si possible, sinon expunge définitif. */
   deleteMessage: (id: number, uid: number, opts?: { folder?: string; permanent?: boolean }) =>
     request<{ success: boolean; action: 'moved_to_trash' | 'expunged'; trash?: string }>(

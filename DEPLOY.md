@@ -30,7 +30,7 @@ Après **A3**, les comptes bureau initiaux sont créés au **premier démarrage 
 | **B1** | Code sur Git | Créez un dépôt avec le contenu du dossier **`afrilex`**, puis poussez-y le code (`git push`). |
 | **B2** | Service web | **Render** → **New +** → **Blueprint** → branchez le dépôt → fichier **`render.yaml`** à la racine **ou** **Web Service** Node, racine du repo = projet **afrilex**. |
 | **B3** | Build / Start | **Build** : `npm ci` — **Start** : `npm start`. Node **20+** (voir `package.json` → `engines`). |
-| **B4** | Variables | **`SUPABASE_URL`**, **`SUPABASE_SERVICE_ROLE_KEY`**, **`GROQ_API_KEY`** (conseillé pour chat + assistant). |
+| **B4** | Variables | **`SUPABASE_URL`**, **`SUPABASE_SERVICE_ROLE_KEY`**, **`GROQ_API_KEY`** (conseillé). Boîte mail : copier **`MAILBOX_LWS_PROXY_URL`** et **`MAILBOX_PROXY_SECRET`** depuis **`.env.mailbox-relay.local`** (voir **`MAILBOX-RELAY.md`**). |
 | **B5** | URL du service | Copiez l’URL publique (ex. `https://afrilex-api-xxxx.onrender.com`) **sans** slash final. |
 | **B6** | Test | Ouvrez **`https://VOTRE-URL/api/bureau/health`** → JSON **`{"ok":true}`**. |
 
@@ -48,7 +48,7 @@ Fichier **`render.yaml`** : service Web + healthcheck `/api/bureau/health` ; sec
 | **C4** | WordPress | **`VITE_WP_REST_BASE`** : utilisée **sur votre PC** pendant **`npm run build`** pour générer **`blog-feed.json`** (articles copiés dans **`dist/`**). Les visiteurs ne dépendent plus de `/wp-json` sur le domaine du site. |
 | **C5** | Build | `npm ci` puis **`npm run build`** : vérif `.env.production` → synchro WordPress → **`blog-feed.json`** → Vite → **`dist/`**. |
 | **C5b** | *(optionnel)* | Éditer **`dist/runtime-config.js`** sur l’hébergeur pour changer les URLs sans refaire un build. |
-| **C6** | Upload | **Tout** **`dist/`** : **`blog-feed.json`**, **`runtime-config.js`**, **`.htaccess`**, **`assets/`**, **`index.html`**. Commentaires blog : **`VITE_API_URL`** doit pointer vers votre API (ex. Render), comme le contact. |
+| **C6** | Upload | **Tout** **`dist/`** : **`blog-feed.json`**, **`runtime-config.js`**, **`.htaccess`**, **`assets/`**, **`index.html`**, et **`api/bureau/mailbox-send.php`** + **`api/mailbox-relay.config.php`** (relais boîte mail — voir **`MAILBOX-RELAY.md`**). Commentaires blog : **`VITE_API_URL`** doit pointer vers votre API (ex. Render), comme le contact. |
 
 ---
 

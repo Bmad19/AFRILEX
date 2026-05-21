@@ -1,0 +1,6 @@
+# Transmettre Authorization à PHP (Apache CGI / LWS)
+<IfModule mod_rewrite.c>
+RewriteEngine On
+RewriteCond %{HTTP:Authorization} .
+RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
+</IfModule>
